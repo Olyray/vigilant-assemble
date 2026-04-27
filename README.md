@@ -1,50 +1,36 @@
-# VIGILANT — Agents Assemble Hackathon
+# 🛡️ VIGILANT: The Mother-Child HIV Safety Net
 
-**Interoperable Healthcare AI Superpowers**
-MCP Server + SHARP Context + FHIR | Runs on [Prompt Opinion](https://www.promptopinion.ai/)
+**Interoperable Healthcare AI Superpowers for the Prompt Opinion Ecosystem**
 
-## Quick Start
+> **Winner/Submission for the Agents Assemble Hackathon (May 2026)** > Built at the intersection of **MCP, A2A, and FHIR**.
 
-1. Watch the [Getting Started Video](https://youtu.be/Qvs_QK4meHc)
-2. Read `SUBMISSION_GUIDE.md` — full step-by-step checklist
-3. Deploy `mcp_server.py` to a server
-4. Publish tools to Prompt Opinion Marketplace
-5. Record video using `VIDEO_SCRIPT.md`
-6. Submit on [DevPost](https://agents-assemble.devpost.com/) before **May 11, 2026**
+## 🎯 The Endgame Challenge
 
-## Files (15 total)
+Every year, roughly **130,000 children** are newly infected with HIV, predominantly in Sub-Saharan Africa. The core failure isn't a lack of medication—it's a lack of **maternal clinical context** at the moment of birth. When delivery wards can't access fragmented HIV records, newborns miss the critical **6-hour window** for high-risk prophylaxis.
 
-### Guides (5 docs — read these)
-| # | File | Purpose |
-|---|------|---------|
-| 1 | `README.md` | This file — quick start |
-| 2 | `SUBMISSION_GUIDE.md` | **Start here** — full submission checklist + Prompt Opinion integration steps |
-| 3 | `VIDEO_SCRIPT.md` | 3-min demo video script |
-| 4 | `VIGILANT_Proposal_v2.md` | Design doc — the vision |
-| 5 | `VIGILANT_Implementation_Guide.md` | Technical build guide |
+## 🦸‍♂️ Our Superpowers (MCP Tools)
 
-### Code (7 files — deploy these)
-| # | File | Purpose |
-|---|------|---------|
-| 6 | `mcp_server.py` | **Main deliverable** — MCP server with 3 tools, publish to Prompt Opinion |
-| 7 | `app.py` | Streamlit UI — optional local demo |
-| 8 | `agents.py` | 3 AI agents: Forensic Linker, Adherence Miner, Protocol Guardian |
-| 9 | `security.py` | SHA-256 audit log + role-based access control |
-| 10 | `fhir_layer.py` | FHIR client + resource builders + SHARP context handler |
-| 11 | `schemas.py` | Data contracts (Mother, Newborn, RiskFlag, etc.) |
-| 12 | `requirements.txt` | Python dependencies |
+VIGILANT provides three composable AI superpowers, exposed as an **MCP Server**, that any agent on the Prompt Opinion platform can invoke:
 
-### Test Data (3 files)
-| # | File | Purpose |
-|---|------|---------|
-| 13 | `data/generate_data.py` | Generates 50 synthetic test cases |
-| 14 | `data/mothers.json` | Sample mother records |
-| 15 | `data/newborns.json` | Sample newborn records |
+1. **`link_infant_to_mother` (Forensic Linker):** Probabilistically matches unlinked newborns ("Baby of X") to HIV+ mothers across fragmented records.
+2. **`extract_adherence_risks` (Adherence Miner):** Uses AI to extract hidden risk signals (e.g., missed pharmacy pickups, transport issues) from unstructured clinical notes.
+3. **`classify_infant_risk` (Protocol Guardian):** A deterministic, WHO-aligned rule engine that combines viral load and adherence scores to classify risk (HIGH/MODERATE/LOW) and generate actionable **FHIR Tasks** and **CarePlans**.
+4. **`run_full_workflow`:** Orchestrates the entire safety net in a single call chain.
 
-## 3 MCP Tools (Superpowers)
+## 🔌 Platform Interoperability
 
-| Tool | What It Does |
-|------|-------------|
-| `link_infant_to_mother` | Matches unlinked infants to mothers across fragmented records |
-| `extract_adherence_risks` | Extracts hidden risk signals from clinical notes |
-| `classify_infant_risk` | Classifies infant risk (HIGH/MODERATE/LOW) + recommends drug regimen |
+VIGILANT solves the "plumbing" problem of healthcare AI:
+
+- **SHARP Context:** Natively accepts `patientId`, `fhirBaseUrl`, and `accessToken` directly from Prompt Opinion EHR sessions.
+- **FHIR R4 Native:** All inputs and outputs map to standard FHIR resources (`Patient`, `Observation`, `DocumentReference`, `Task`, `CarePlan`).
+- **NDPA 2023 Compliant:** Features an immutable **SHA-256 Hash-Chained Audit Log** and Role-Based Access Control (RBAC) to ensure data minimization and sovereignty.
+
+## 🚀 How to Run & Deploy
+
+### Local Development
+
+```bash
+pip install -r requirements.txt
+python mcp_server.py
+# Server runs on port 8000
+```
