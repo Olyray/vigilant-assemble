@@ -29,12 +29,15 @@ from schemas import (
 # Gemma 4 via Ollama Setup (for Adherence Miner)
 # =============================================
 
-GEMMA_MODEL = os.environ.get("GEMMA_MODEL", "gemma4")
+GEMMA_MODEL = os.environ.get("GEMMA_MODEL", "gemma4:e2b")
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 
 HAS_GEMMA = False
+_ollama_client = None
 if _HAS_OLLAMA_LIB:
     try:
-        _ollama_lib.list()
+        _ollama_client = _ollama_lib.Client(host=OLLAMA_HOST)
+        _ollama_client.list()
         HAS_GEMMA = True
     except Exception:
         HAS_GEMMA = False
@@ -224,7 +227,7 @@ def extract_adherence_risks(clinical_notes: list) -> list:
         notes_text += f"[Date: {note.get('date', 'unknown')}]\n{note['content']}\n\n"
 
     try:
-        response = _ollama_lib.chat(
+        response = _ollama_client.chat(
             model=GEMMA_MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
