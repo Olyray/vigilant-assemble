@@ -384,5 +384,13 @@ def run_full_workflow(infant_id: str) -> dict:
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    http_app = mcp.http_app(middleware=[Middleware(_FHIRCapabilityMiddleware)])
+    # stateless_http=True: each request is independent (no persistent SSE sessions).
+    # json_response=True: initialize/tool responses are plain JSON, not SSE streams.
+    # Both are required for Railway's proxy and for _FHIRCapabilityMiddleware to
+    # intercept the initialize response (SSE responses cannot be buffered/patched).
+    http_app = mcp.http_app(
+        middleware=[Middleware(_FHIRCapabilityMiddleware)],
+        stateless_http=True,
+        json_response=True,
+    )
     uvicorn.run(http_app, host="0.0.0.0", port=port)
