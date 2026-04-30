@@ -16,8 +16,10 @@ Hackathon: Agents Assemble
 AI Backend: Gemma 4 (Local via Ollama)
 """
 
+import asyncio
 import json
 import os
+import socket
 import sys
 import uuid
 
@@ -382,6 +384,19 @@ def run_full_workflow(infant_id: str) -> dict:
     }
 
 
+def _bind_socket(host: str, port: int) -> socket.socket | None:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind((host, port))
+    except OSError:
+        sock.close()
+        return None
+    sock.listen(2048)
+    sock.set_inheritable(True)
+    return sock
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     # stateless_http=True: each request is independent (no persistent SSE sessions).
@@ -393,4 +408,21 @@ if __name__ == "__main__":
         stateless_http=True,
         json_response=True,
     )
-    uvicorn.run(http_app, host="0.0.0.0", port=port)
+
+    candidate_ports = []
+    for candidate in (port, 8000, 8501):
+        if candidate not in candidate_ports:
+            candidate_ports.append(candidate)
+
+    sockets = []
+    for candidate in candidate_ports:
+        sock = _bind_socket("0.0.0.0", candidate)
+        if sock is not None:
+            sockets.append(sock)
+
+    if not sockets:
+        raise RuntimeError(f"Failed to bind any listening socket from {candidate_ports}")
+
+    config = uvicorn.Config(http_app, host="0.0.0.0", port=port)
+    server = uvicorn.Server(config)
+    asyncio.run(server.serve(sockets=sockets))
