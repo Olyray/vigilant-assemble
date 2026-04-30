@@ -26,6 +26,7 @@ import uuid
 sys.path.insert(0, os.path.dirname(__file__))
 
 import uvicorn
+from typing import Optional
 from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_headers
 from starlette.middleware import Middleware
@@ -105,7 +106,8 @@ from agents import (
 )
 from fhir_layer import (
     create_fhir_task, create_fhir_care_plan,
-    get_mothers, get_patient_by_id,
+    get_mothers, get_newborns, get_patient_by_id, find_patient_by_name_or_id,
+    _patient_display_name,
 )
 from security import (
     parse_auth_context, is_authorized, filter_output_by_role,
@@ -149,6 +151,48 @@ def _ctx_from_headers() -> dict:
     }
 
 
+def _resolve_infant(query: str, ctx: dict) -> Optional[dict]:
+    """Resolve an infant by name or UUID."""
+    return find_patient_by_name_or_id(
+        query, ["newborns.json"], ctx["fhir_server"], ctx["fhir_token"]
+    )
+
+
+def _resolve_mother(query: str, ctx: dict) -> Optional[dict]:
+    """Resolve a mother by name or UUID."""
+    return find_patient_by_name_or_id(
+        query, ["mothers.json"], ctx["fhir_server"], ctx["fhir_token"]
+    )
+
+
+# --- MCP Tool 0: List Patients ---
+
+@mcp.tool
+def list_patients(category: str = "all") -> dict:
+    """Lists available patients in the system so you can find the right name or ID to use.
+
+    category: 'infants', 'mothers', or 'all' (default).
+    Returns names and IDs. Use names directly with the other tools.
+    """
+    ctx = _ctx_from_headers()
+    result = {}
+    if category in ("infants", "all"):
+        newborns = get_newborns(ctx["fhir_server"], ctx["fhir_token"])
+        result["infants"] = [
+            {"id": nb["id"], "name": _patient_display_name(nb),
+             "birth_date": nb.get("birthDate", ""),
+             "facility": nb.get("meta", {}).get("facility", "")}
+            for nb in newborns
+        ]
+    if category in ("mothers", "all"):
+        mothers = get_mothers(ctx["fhir_server"], ctx["fhir_token"])
+        result["mothers"] = [
+            {"id": m["id"], "name": _patient_display_name(m)}
+            for m in mothers
+        ]
+    return result
+
+
 # --- Health Check (custom HTTP route, not an MCP tool) ---
 
 @mcp.custom_route("/", methods=["GET"])
@@ -170,7 +214,10 @@ async def health_check(request: Request) -> JSONResponse:
 
 @mcp.tool
 def link_infant_to_mother(infant_id: str) -> dict:
-    """Links a newborn to their HIV+ mother across fragmented records using probabilistic identity matching."""
+    """Links a newborn to their HIV+ mother using probabilistic identity matching.
+
+    infant_id: the infant's name (e.g. 'Baby of Grace Adeyemi') or UUID.
+    """
     ctx = _ctx_from_headers()
     auth = parse_auth_context(ctx)
 
@@ -179,10 +226,19 @@ def link_infant_to_mother(infant_id: str) -> dict:
         return {"error": "ACCESS DENIED", "role": auth.role}
 
     mothers = get_mothers(ctx["fhir_server"], ctx["fhir_token"])
-    infant = get_patient_by_id(infant_id, ctx["fhir_server"], ctx["fhir_token"])
+    infant = _resolve_infant(infant_id, ctx)
 
     if not infant:
-        return {"error": f"Infant {infant_id} not found"}
+        # Return the list of available infants so the caller can pick one
+        newborns = get_newborns(ctx["fhir_server"], ctx["fhir_token"])
+        return {
+            "error": f"Infant '{infant_id}' not found",
+            "hint": "Use list_patients to see available infants, then retry with an exact name or ID.",
+            "sample_infants": [
+                {"id": nb["id"], "name": _patient_display_name(nb)}
+                for nb in newborns[:5]
+            ],
+        }
 
     candidates = find_mother(infant, mothers)
 
@@ -236,7 +292,10 @@ def link_infant_to_mother(infant_id: str) -> dict:
 
 @mcp.tool
 def extract_adherence_risks(mother_id: str) -> dict:
-    """Extracts hidden ART adherence risk signals from clinical notes using Gemma4."""
+    """Extracts hidden ART adherence risk signals from clinical notes using Gemma4.
+
+    mother_id: the mother's name (e.g. 'Ruth Banda') or UUID.
+    """
     ctx = _ctx_from_headers()
     auth = parse_auth_context(ctx)
 
@@ -244,9 +303,10 @@ def extract_adherence_risks(mother_id: str) -> dict:
         log_access_denied(auth.user_id, auth.role, "extract_adherence_risks")
         return {"error": "ACCESS DENIED", "role": auth.role}
 
-    mother = get_patient_by_id(mother_id, ctx["fhir_server"], ctx["fhir_token"])
+    mother = _resolve_mother(mother_id, ctx)
     if not mother:
-        return {"error": f"Mother {mother_id} not found"}
+        return {"error": f"Mother '{mother_id}' not found",
+                "hint": "Use list_patients to see available mothers."}
 
     notes = mother.get("clinical_notes", [])
     risks = _run_adherence_extraction(notes) if HAS_GEMMA else _run_adherence_extraction_offline(notes)
@@ -288,7 +348,11 @@ def extract_adherence_risks(mother_id: str) -> dict:
 
 @mcp.tool
 def classify_infant_risk(infant_id: str, mother_id: str) -> dict:
-    """Classifies infant HIV exposure risk per WHO PMTCT protocol and generates a FHIR Task."""
+    """Classifies infant HIV exposure risk per WHO PMTCT protocol and generates a FHIR Task.
+
+    infant_id: infant name or UUID.
+    mother_id: mother name or UUID. If unknown, run link_infant_to_mother first.
+    """
     ctx = _ctx_from_headers()
     auth = parse_auth_context(ctx)
 
@@ -296,13 +360,15 @@ def classify_infant_risk(infant_id: str, mother_id: str) -> dict:
         log_access_denied(auth.user_id, auth.role, "classify_infant_risk")
         return {"error": "ACCESS DENIED", "role": auth.role}
 
-    mother = get_patient_by_id(mother_id, ctx["fhir_server"], ctx["fhir_token"])
-    infant = get_patient_by_id(infant_id, ctx["fhir_server"], ctx["fhir_token"])
+    mother = _resolve_mother(mother_id, ctx)
+    infant = _resolve_infant(infant_id, ctx)
 
     if not mother:
-        return {"error": f"Mother {mother_id} not found"}
+        return {"error": f"Mother '{mother_id}' not found",
+                "hint": "Use list_patients to see available mothers."}
     if not infant:
-        return {"error": f"Infant {infant_id} not found"}
+        return {"error": f"Infant '{infant_id}' not found",
+                "hint": "Use list_patients to see available infants."}
 
     notes = mother.get("clinical_notes", [])
     risks = _run_adherence_extraction(notes) if HAS_GEMMA else _run_adherence_extraction_offline(notes)
@@ -348,13 +414,31 @@ def classify_infant_risk(infant_id: str, mother_id: str) -> dict:
 
 @mcp.tool
 def run_full_workflow(infant_id: str) -> dict:
-    """Runs the complete VIGILANT pipeline: link infant to mother → extract adherence risks → classify risk."""
+    """Runs the complete VIGILANT pipeline: link infant to mother → extract adherence risks → classify risk.
+
+    infant_id: infant name (e.g. 'Baby of Aisha Phiri') or UUID.
+    """
     ctx = _ctx_from_headers()
     auth = parse_auth_context(ctx)
 
     if not is_authorized(auth):
         log_access_denied(auth.user_id, auth.role, "run_full_workflow")
         return {"error": "ACCESS DENIED", "role": auth.role}
+
+    # Resolve name to ID first so downstream tools get a stable UUID
+    ctx2 = _ctx_from_headers()
+    resolved = _resolve_infant(infant_id, ctx2)
+    if not resolved:
+        newborns = get_newborns(ctx2["fhir_server"], ctx2["fhir_token"])
+        return {
+            "error": f"Infant '{infant_id}' not found",
+            "hint": "Use list_patients to see available infants.",
+            "sample_infants": [
+                {"id": nb["id"], "name": _patient_display_name(nb)}
+                for nb in newborns[:5]
+            ],
+        }
+    infant_id = resolved["id"]
 
     link_result = link_infant_to_mother(infant_id)
     if link_result.get("status") != "match_found":

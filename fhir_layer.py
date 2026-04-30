@@ -62,6 +62,47 @@ def get_patient_by_id(patient_id: str, fhir_server: str = "",
     return None
 
 
+def _patient_display_name(patient: dict) -> str:
+    """Return a single display string for a patient."""
+    name_block = patient.get("name", [{}])[0]
+    given = " ".join(name_block.get("given", []))
+    family = name_block.get("family", "")
+    return f"{given} {family}".strip()
+
+
+def find_patient_by_name_or_id(query: str, datasets: list[str],
+                               fhir_server: str = "",
+                               fhir_token: str = "") -> Optional[dict]:
+    """Find a patient by UUID or by case-insensitive name substring.
+
+    datasets: list of filenames to search, e.g. ['newborns.json'] or ['mothers.json']
+    Returns the first match, or None.
+    """
+    query = query.strip()
+    query_lower = query.lower()
+
+    # Try exact ID first (UUIDs contain hyphens)
+    for dataset in datasets:
+        if fhir_server and HAS_HTTPX:
+            p = get_patient_by_id(query, fhir_server, fhir_token)
+            if p:
+                return p
+        else:
+            for patient in _load_local_json(dataset):
+                if patient.get("id") == query:
+                    return patient
+
+    # Fall back to name substring match
+    for dataset in datasets:
+        candidates = _load_local_json(dataset)
+        for patient in candidates:
+            full_name = _patient_display_name(patient).lower()
+            if query_lower in full_name:
+                return patient
+
+    return None
+
+
 def _fetch_fhir_patients(fhir_server: str, fhir_token: str,
                          category: str = "") -> list:
     """Fetch Patient resources from a remote FHIR server."""
