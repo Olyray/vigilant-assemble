@@ -1,7 +1,8 @@
 """
 VIGILANT MCP Server — Agents Assemble Hackathon Version.
 
-Exposes 4 MCP tools for the Prompt Opinion platform:
+Exposes 5 MCP tools for the Prompt Opinion platform:
+0. list_patients — List available demo patients
 1. link_infant_to_mother — Probabilistic identity matching
 2. extract_adherence_risks — AI-powered clinical note analysis (Gemma 4 via Ollama)
 3. classify_infant_risk — Rule-based risk classification + FHIR Task
@@ -202,6 +203,7 @@ async def health_check(request: Request) -> JSONResponse:
         "status": "running",
         "ai_backend": "Gemma 4 (Local via Ollama)" if HAS_GEMMA else "offline (keyword fallback)",
         "tools": [
+            "list_patients",
             "link_infant_to_mother",
             "extract_adherence_risks",
             "classify_infant_risk",

@@ -9,6 +9,7 @@ Part 3: SHARP Context — parses SMART on FHIR launch context
 import json
 import os
 import uuid
+from difflib import SequenceMatcher
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -17,6 +18,12 @@ try:
     HAS_HTTPX = True
 except ImportError:
     HAS_HTTPX = False
+
+try:
+    from rapidfuzz import fuzz
+    HAS_RAPIDFUZZ = True
+except ImportError:
+    HAS_RAPIDFUZZ = False
 
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
@@ -70,6 +77,23 @@ def _patient_display_name(patient: dict) -> str:
     return f"{given} {family}".strip()
 
 
+def _load_patient_dataset(dataset: str, fhir_server: str = "",
+                          fhir_token: str = "") -> list:
+    """Load a patient dataset from local JSON or the configured FHIR server."""
+    if dataset == "mothers.json":
+        return get_mothers(fhir_server, fhir_token)
+    if dataset == "newborns.json":
+        return get_newborns(fhir_server, fhir_token)
+    return _load_local_json(dataset)
+
+
+def _similarity_score(left: str, right: str) -> float:
+    """Return a fuzzy similarity score on a 0-100 scale."""
+    if HAS_RAPIDFUZZ:
+        return max(fuzz.ratio(left, right), fuzz.partial_ratio(left, right))
+    return SequenceMatcher(None, left, right).ratio() * 100
+
+
 def find_patient_by_name_or_id(query: str, datasets: list[str],
                                fhir_server: str = "",
                                fhir_token: str = "") -> Optional[dict]:
@@ -83,22 +107,34 @@ def find_patient_by_name_or_id(query: str, datasets: list[str],
 
     # Try exact ID first (UUIDs contain hyphens)
     for dataset in datasets:
-        if fhir_server and HAS_HTTPX:
-            p = get_patient_by_id(query, fhir_server, fhir_token)
-            if p:
-                return p
-        else:
-            for patient in _load_local_json(dataset):
-                if patient.get("id") == query:
-                    return patient
+        for patient in _load_patient_dataset(dataset, fhir_server, fhir_token):
+            if patient.get("id") == query:
+                return patient
 
     # Fall back to name substring match
     for dataset in datasets:
-        candidates = _load_local_json(dataset)
+        candidates = _load_patient_dataset(dataset, fhir_server, fhir_token)
         for patient in candidates:
             full_name = _patient_display_name(patient).lower()
             if query_lower in full_name:
                 return patient
+
+    # Fuzzy fallback for synthetic dirty data like "Piri" vs "Phiri".
+    best_match = None
+    best_score = 0.0
+    for dataset in datasets:
+        candidates = _load_patient_dataset(dataset, fhir_server, fhir_token)
+        for patient in candidates:
+            full_name = _patient_display_name(patient).lower()
+            if not full_name:
+                continue
+            score = _similarity_score(query_lower, full_name)
+            if score > best_score:
+                best_score = score
+                best_match = patient
+
+    if best_score >= 85:
+        return best_match
 
     return None
 
