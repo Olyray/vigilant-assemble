@@ -8,4 +8,4 @@ RUN python data/generate_data.py || true
 # Expose Streamlit (8501) and MCP Server (8000)
 EXPOSE 8501 8000
 # Run MCP server by default; override with streamlit if needed
-CMD ["uvicorn", "mcp_server:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "mcp_server.py"]

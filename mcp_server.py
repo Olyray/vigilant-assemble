@@ -1,12 +1,16 @@
 """
 VIGILANT MCP Server — Agents Assemble Hackathon Version.
 
-Exposes 3 MCP tools for the Prompt Opinion platform:
+Exposes 4 MCP tools for the Prompt Opinion platform:
 1. link_infant_to_mother — Probabilistic identity matching
 2. extract_adherence_risks — AI-powered clinical note analysis (Gemma 4 via Ollama)
 3. classify_infant_risk — Rule-based risk classification + FHIR Task
+4. run_full_workflow — Complete pipeline: Link → Extract → Classify
 
-Uses SHARP context for healthcare data propagation and role-based access.
+Prompt Opinion delivers FHIR context via HTTP request headers:
+  X-FHIR-Server-URL   → FHIR server base URL
+  X-FHIR-Access-Token → OAuth bearer token
+  X-Patient-ID        → Current patient ID
 
 Hackathon: Agents Assemble
 AI Backend: Gemma 4 (Local via Ollama)
@@ -19,28 +23,101 @@ import uuid
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from fastapi import FastAPI, Request
-from pydantic import BaseModel
-from typing import Optional
+import uvicorn
+from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_http_headers
+from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
+
+# ---------------------------------------------------------------------------
+# Prompt Opinion FHIR Context Extension
+#
+# Prompt Opinion reads capabilities.extensions["ai.promptopinion/fhir-context"]
+# from the MCP initialize response to decide whether to send FHIR headers.
+# WITHOUT this extension, Prompt Opinion will NEVER send X-FHIR-Server-URL,
+# X-FHIR-Access-Token, or X-Patient-ID — making real EHR data inaccessible.
+#
+# fastmcp has no built-in API for capabilities.extensions, so we inject it
+# via a Starlette response middleware that patches initialize responses.
+# ---------------------------------------------------------------------------
+
+_FHIR_CAPABILITY_EXTENSION = {
+    "ai.promptopinion/fhir-context": {
+        "scopes": [
+            # patient/Patient.rs — required: read mother and infant Patient records
+            {"name": "patient/Patient.rs", "required": True},
+            # patient/Observation.rs — optional: viral load lab results
+            {"name": "patient/Observation.rs"},
+            # patient/Condition.rs — optional: HIV diagnosis conditions
+            {"name": "patient/Condition.rs"},
+            # patient/MedicationRequest.rs — optional: ART prescriptions
+            {"name": "patient/MedicationRequest.rs"},
+            # patient/DocumentReference.rs — optional: clinical notes
+            {"name": "patient/DocumentReference.rs"},
+        ]
+    }
+}
+
+
+class _FHIRCapabilityMiddleware(BaseHTTPMiddleware):
+    """Starlette middleware that injects capabilities.extensions into MCP
+    initialize responses so Prompt Opinion will send FHIR context headers."""
+
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        # Only JSON responses need patching (initialize is JSON, SSE streams are text/event-stream)
+        content_type = response.headers.get("content-type", "")
+        if request.method != "POST" or "application/json" not in content_type:
+            return response
+        # Buffer body
+        body = b""
+        async for chunk in response.body_iterator:
+            body += chunk
+        try:
+            data = json.loads(body)
+            result = data.get("result", {})
+            if isinstance(result, dict) and "capabilities" in result:
+                caps = result["capabilities"]
+                if "extensions" not in caps:
+                    caps["extensions"] = {}
+                caps["extensions"].update(_FHIR_CAPABILITY_EXTENSION)
+                body = json.dumps(data).encode()
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass
+        headers = dict(response.headers)
+        headers["content-length"] = str(len(body))
+        return Response(
+            content=body,
+            status_code=response.status_code,
+            headers=headers,
+            media_type=response.media_type,
+        )
 
 from agents import (
-    find_mother, extract_adherence_risks, extract_adherence_risks_offline,
-    HAS_GEMMA, classify_risk, build_bridge_summary
+    find_mother,
+    extract_adherence_risks as _run_adherence_extraction,
+    extract_adherence_risks_offline as _run_adherence_extraction_offline,
+    HAS_GEMMA, classify_risk, build_bridge_summary,
 )
 from fhir_layer import (
     create_fhir_task, create_fhir_care_plan,
-    get_mothers, get_newborns, get_patient_by_id,
-    parse_sharp_context
+    get_mothers, get_patient_by_id,
 )
 from security import (
     parse_auth_context, is_authorized, filter_output_by_role,
-    log_linkage, log_risk_classification, log_access_denied, log_data_access, verify_chain
+    log_linkage, log_risk_classification, log_access_denied, log_data_access,
 )
 
-app = FastAPI(
-    title="VIGILANT MCP Server — Agents Assemble",
-    description="Mother-Child HIV Safety Net — MCP tools for linking newborns to maternal HIV records (Gemma 4 via Ollama)",
-    version="1.0.0",
+mcp = FastMCP(
+    "VIGILANT — Infant HIV Risk Detection",
+    instructions=(
+        "Three MCP tools for infant HIV exposure risk management under the WHO PMTCT protocol. "
+        "Use link_infant_to_mother first to find the mother, then extract_adherence_risks to "
+        "surface hidden ART adherence signals, then classify_infant_risk for a risk verdict and "
+        "FHIR Task. Or call run_full_workflow to run the complete pipeline in one step."
+    ),
 )
 
 
@@ -49,31 +126,32 @@ def _audit_id() -> str:
     return f"audit_{uuid.uuid4().hex[:12]}"
 
 
-# --- Pydantic Models for MCP Tool Inputs ---
+def _ctx_from_headers() -> dict:
+    """Build a SHARP-compatible context dict from Prompt Opinion FHIR request headers.
 
-class LinkInfantInput(BaseModel):
-    infant_id: str
-    sharp_context: Optional[dict] = {}
-
-class AdherenceInput(BaseModel):
-    mother_id: str
-    sharp_context: Optional[dict] = {}
-
-class ClassifyRiskInput(BaseModel):
-    infant_id: str
-    mother_id: str
-    sharp_context: Optional[dict] = {}
-
-class FullWorkflowInput(BaseModel):
-    infant_id: str
-    sharp_context: Optional[dict] = {}
-
-
-# --- Health Check ---
-
-@app.get("/")
-def health_check():
+    Prompt Opinion sends:  X-FHIR-Server-URL, X-FHIR-Access-Token, X-Patient-ID.
+    Role defaults to 'hiv_specialist' so the demo works without an auth header.
+    Returns empty-safe values when running outside an HTTP context (local tests).
+    """
+    headers = get_http_headers()
+    fhir_token = headers.get("x-fhir-access-token", "")
     return {
+        "patient_id":   headers.get("x-patient-id", ""),
+        "fhir_server":  headers.get("x-fhir-server-url", ""),
+        "fhir_token":   fhir_token,
+        "token":        fhir_token,
+        "role":         headers.get("x-role", "hiv_specialist"),
+        "user_id":      headers.get("x-user-id", "mcp_client"),
+        "facility_id":  headers.get("x-facility-id", ""),
+        "organization": headers.get("x-organization", ""),
+    }
+
+
+# --- Health Check (custom HTTP route, not an MCP tool) ---
+
+@mcp.custom_route("/", methods=["GET"])
+async def health_check(request: Request) -> JSONResponse:
+    return JSONResponse({
         "service": "VIGILANT MCP Server — Agents Assemble",
         "status": "running",
         "ai_backend": "Gemma 4 (Local via Ollama)" if HAS_GEMMA else "offline (keyword fallback)",
@@ -83,40 +161,40 @@ def health_check():
             "classify_infant_risk",
             "run_full_workflow",
         ],
-    }
+    })
 
 
 # --- MCP Tool 1: Link Infant to Mother ---
 
-@app.post("/tools/link_infant_to_mother")
-def tool_link_infant_to_mother(input: LinkInfantInput):
-    """MCP Tool: Probabilistic identity matching for 'Baby of X' cases."""
-    ctx = parse_sharp_context(input.sharp_context or {})
+@mcp.tool
+def link_infant_to_mother(infant_id: str) -> dict:
+    """Links a newborn to their HIV+ mother across fragmented records using probabilistic identity matching."""
+    ctx = _ctx_from_headers()
     auth = parse_auth_context(ctx)
 
     if not is_authorized(auth):
         log_access_denied(auth.user_id, auth.role, "link_infant_to_mother")
         return {"error": "ACCESS DENIED", "role": auth.role}
 
-    mothers = get_mothers(ctx.get("fhir_server", ""), ctx.get("fhir_token", ""))
-    infant = get_patient_by_id(input.infant_id, ctx.get("fhir_server", ""), ctx.get("fhir_token", ""))
+    mothers = get_mothers(ctx["fhir_server"], ctx["fhir_token"])
+    infant = get_patient_by_id(infant_id, ctx["fhir_server"], ctx["fhir_token"])
 
     if not infant:
-        return {"error": f"Infant {input.infant_id} not found"}
+        return {"error": f"Infant {infant_id} not found"}
 
     candidates = find_mother(infant, mothers)
 
     if not candidates:
-        log_linkage(auth.user_id, auth.role, input.infant_id, "",
+        log_linkage(auth.user_id, auth.role, infant_id, "",
                     0.0, "no_match", auth.organization)
         return {
             "status": "no_match",
             "message": "No confident match found. Flagged for manual review.",
-            "infant_id": input.infant_id,
+            "infant_id": infant_id,
         }
 
     linkage = candidates[0]
-    log_linkage(auth.user_id, auth.role, input.infant_id, linkage.mother_id,
+    log_linkage(auth.user_id, auth.role, infant_id, linkage.mother_id,
                 linkage.confidence, "auto_flagged", auth.organization)
 
     result = {
@@ -154,28 +232,24 @@ def tool_link_infant_to_mother(input: LinkInfantInput):
 
 # --- MCP Tool 2: Extract Adherence Risks ---
 
-@app.post("/tools/extract_adherence_risks")
-def tool_extract_adherence_risks(input: AdherenceInput):
-    """MCP Tool: AI-powered clinical note analysis for hidden adherence risks."""
-    ctx = parse_sharp_context(input.sharp_context or {})
+@mcp.tool
+def extract_adherence_risks(mother_id: str) -> dict:
+    """Extracts hidden ART adherence risk signals from clinical notes using Gemma4."""
+    ctx = _ctx_from_headers()
     auth = parse_auth_context(ctx)
 
     if not is_authorized(auth):
         log_access_denied(auth.user_id, auth.role, "extract_adherence_risks")
         return {"error": "ACCESS DENIED", "role": auth.role}
 
-    mother = get_patient_by_id(input.mother_id, ctx.get("fhir_server", ""), ctx.get("fhir_token", ""))
+    mother = get_patient_by_id(mother_id, ctx["fhir_server"], ctx["fhir_token"])
     if not mother:
-        return {"error": f"Mother {input.mother_id} not found"}
+        return {"error": f"Mother {mother_id} not found"}
 
     notes = mother.get("clinical_notes", [])
+    risks = _run_adherence_extraction(notes) if HAS_GEMMA else _run_adherence_extraction_offline(notes)
 
-    if HAS_GEMMA:
-        risks = extract_adherence_risks(notes)
-    else:
-        risks = extract_adherence_risks_offline(notes)
-
-    log_data_access(auth.user_id, auth.role, f"mother/{input.mother_id}/notes",
+    log_data_access(auth.user_id, auth.role, f"mother/{mother_id}/notes",
                     ["clinical_notes"], auth.organization)
 
     _gov = {
@@ -186,7 +260,7 @@ def tool_extract_adherence_risks(input: AdherenceInput):
 
     if auth.role == "hiv_specialist":
         return {
-            "mother_id": input.mother_id,
+            "mother_id": mother_id,
             "risk_count": len(risks),
             "risks": [
                 {
@@ -201,7 +275,7 @@ def tool_extract_adherence_risks(input: AdherenceInput):
         }
     else:
         return {
-            "mother_id": input.mother_id,
+            "mother_id": mother_id,
             "risk_count": len(risks),
             "has_adherence_concerns": len(risks) > 0,
             "data_governance": _gov,
@@ -210,30 +284,30 @@ def tool_extract_adherence_risks(input: AdherenceInput):
 
 # --- MCP Tool 3: Classify Infant Risk ---
 
-@app.post("/tools/classify_infant_risk")
-def tool_classify_infant_risk(input: ClassifyRiskInput):
-    """MCP Tool: Rule-based risk classification + FHIR Task generation."""
-    ctx = parse_sharp_context(input.sharp_context or {})
+@mcp.tool
+def classify_infant_risk(infant_id: str, mother_id: str) -> dict:
+    """Classifies infant HIV exposure risk per WHO PMTCT protocol and generates a FHIR Task."""
+    ctx = _ctx_from_headers()
     auth = parse_auth_context(ctx)
 
     if not is_authorized(auth):
         log_access_denied(auth.user_id, auth.role, "classify_infant_risk")
         return {"error": "ACCESS DENIED", "role": auth.role}
 
-    mother = get_patient_by_id(input.mother_id, ctx.get("fhir_server", ""), ctx.get("fhir_token", ""))
-    infant = get_patient_by_id(input.infant_id, ctx.get("fhir_server", ""), ctx.get("fhir_token", ""))
+    mother = get_patient_by_id(mother_id, ctx["fhir_server"], ctx["fhir_token"])
+    infant = get_patient_by_id(infant_id, ctx["fhir_server"], ctx["fhir_token"])
 
     if not mother:
-        return {"error": f"Mother {input.mother_id} not found"}
+        return {"error": f"Mother {mother_id} not found"}
     if not infant:
-        return {"error": f"Infant {input.infant_id} not found"}
+        return {"error": f"Infant {infant_id} not found"}
 
     notes = mother.get("clinical_notes", [])
-    risks = extract_adherence_risks(notes) if HAS_GEMMA else extract_adherence_risks_offline(notes)
+    risks = _run_adherence_extraction(notes) if HAS_GEMMA else _run_adherence_extraction_offline(notes)
 
     risk = classify_risk(mother, risks)
 
-    mothers = get_mothers(ctx.get("fhir_server", ""), ctx.get("fhir_token", ""))
+    mothers = get_mothers(ctx["fhir_server"], ctx["fhir_token"])
     candidates = find_mother(infant, mothers)
 
     if not candidates:
@@ -242,7 +316,7 @@ def tool_classify_infant_risk(input: ClassifyRiskInput):
     linkage = candidates[0]
     summary = build_bridge_summary(infant, linkage, risk)
 
-    log_risk_classification(auth.user_id, input.infant_id, input.mother_id,
+    log_risk_classification(auth.user_id, infant_id, mother_id,
                             risk.level, risk.reasons, auth.organization)
 
     task = create_fhir_task(summary)
@@ -251,11 +325,10 @@ def tool_classify_infant_risk(input: ClassifyRiskInput):
 
     filtered = filter_output_by_role(summary, auth)
     filtered["fhir_task"] = task
-
     filtered["data_governance"] = {
         "access_level": "restricted",
         "data_source": "HIV_program (APIN-like)",
-        "audit_log_id": f"txn_{hash(input.infant_id + input.mother_id) % 100000:05d}",
+        "audit_log_id": f"txn_{hash(infant_id + mother_id) % 100000:05d}",
         "disclosure_note": (
             "Only clinically necessary information shared. "
             "Full HIV records remain in source program."
@@ -269,37 +342,26 @@ def tool_classify_infant_risk(input: ClassifyRiskInput):
     return filtered
 
 
-# --- Bonus: Full Workflow (Tool 1 + 2 + 3 in sequence) ---
+# --- MCP Tool 4: Full Workflow ---
 
-@app.post("/tools/run_full_workflow")
-def tool_run_full_workflow(input: FullWorkflowInput):
-    """Run the complete VIGILANT workflow: Link → Extract → Classify."""
-    ctx = parse_sharp_context(input.sharp_context or {})
+@mcp.tool
+def run_full_workflow(infant_id: str) -> dict:
+    """Runs the complete VIGILANT pipeline: link infant to mother → extract adherence risks → classify risk."""
+    ctx = _ctx_from_headers()
     auth = parse_auth_context(ctx)
 
     if not is_authorized(auth):
         log_access_denied(auth.user_id, auth.role, "run_full_workflow")
         return {"error": "ACCESS DENIED", "role": auth.role}
 
-    link_result = tool_link_infant_to_mother(
-        LinkInfantInput(infant_id=input.infant_id, sharp_context=input.sharp_context)
-    )
+    link_result = link_infant_to_mother(infant_id)
     if link_result.get("status") != "match_found":
         return {"step": "linkage", "result": link_result}
 
     mother_id = link_result["mother_id"]
 
-    adherence_result = tool_extract_adherence_risks(
-        AdherenceInput(mother_id=mother_id, sharp_context=input.sharp_context)
-    )
-
-    classify_result = tool_classify_infant_risk(
-        ClassifyRiskInput(
-            infant_id=input.infant_id,
-            mother_id=mother_id,
-            sharp_context=input.sharp_context,
-        )
-    )
+    adherence_result = extract_adherence_risks(mother_id)
+    classify_result = classify_infant_risk(infant_id, mother_id)
 
     return {
         "workflow": "complete",
@@ -320,9 +382,7 @@ def tool_run_full_workflow(input: FullWorkflowInput):
     }
 
 
-# --- Run with uvicorn ---
-
 if __name__ == "__main__":
-    import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    http_app = mcp.http_app(middleware=[Middleware(_FHIRCapabilityMiddleware)])
+    uvicorn.run(http_app, host="0.0.0.0", port=port)

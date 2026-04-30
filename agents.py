@@ -246,16 +246,21 @@ def extract_adherence_risks(clinical_notes: list) -> list:
                 risks_data = args.get("risks", [])
                 break
 
-        # --- Hallucination Firewall ---
+        # --- Hallucination Firewall (fuzzy match ≥75% similarity) ---
+        _FIREWALL_THRESHOLD = 75
         risks = []
         for r in risks_data:
             quote = r.get("source_quote", "") if isinstance(r, dict) else ""
-            if not quote or quote.lower() not in notes_text.lower():
-                print(f"🚫 FIREWALL REJECTED: '{quote[:80]}' — source_quote not found in clinical notes")
+            if not quote:
+                print(f"🚫 FIREWALL REJECTED: empty source_quote")
+                continue
+            similarity = fuzz.partial_ratio(quote.lower(), notes_text.lower())
+            if similarity < _FIREWALL_THRESHOLD:
+                print(f"🚫 FIREWALL REJECTED: '{quote[:80]}' — similarity {similarity}% < {_FIREWALL_THRESHOLD}%")
                 continue
             source_date = "unknown"
             for note in clinical_notes:
-                if quote.lower() in note["content"].lower():
+                if fuzz.partial_ratio(quote.lower(), note["content"].lower()) >= _FIREWALL_THRESHOLD:
                     source_date = note.get("date", "unknown")
                     break
             risks.append(AdherenceRisk(
