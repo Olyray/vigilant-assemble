@@ -61,7 +61,9 @@ def get_patient_by_id(patient_id: str, fhir_server: str = "",
                       fhir_token: str = "") -> Optional[dict]:
     """Get a single Patient resource by ID."""
     if fhir_server and HAS_HTTPX:
-        return _fetch_fhir_resource(fhir_server, fhir_token, "Patient", patient_id)
+        patient = _fetch_fhir_resource(fhir_server, fhir_token, "Patient", patient_id)
+        if patient:
+            return patient
     for dataset in ["mothers.json", "newborns.json"]:
         for patient in _load_local_json(dataset):
             if patient.get("id") == patient_id:
@@ -150,12 +152,15 @@ def _fetch_fhir_patients(fhir_server: str, fhir_token: str,
         response = httpx.get(url, headers=headers, timeout=30)
         response.raise_for_status()
         bundle = response.json()
-        return [entry["resource"] for entry in bundle.get("entry", [])]
+        patients = [entry["resource"] for entry in bundle.get("entry", [])]
+        if patients:
+            return patients
+        print("[FHIRClient] Remote FHIR server returned no Patient resources; falling back to bundled demo data.")
     except Exception as e:
         print(f"[FHIRClient] Error fetching patients: {e}")
-        return _load_local_json(
-            "mothers.json" if category == "mother" else "newborns.json"
-        )
+    return _load_local_json(
+        "mothers.json" if category == "mother" else "newborns.json"
+    )
 
 
 def _fetch_fhir_resource(fhir_server: str, fhir_token: str,
