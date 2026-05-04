@@ -2,22 +2,18 @@
 VIGILANT AI Agents — All three agents in one file.
 
 Agent 1: Forensic Linker — Links "Baby of X" infants to their mothers
-Agent 2: Adherence Miner — Extracts hidden adherence risks from clinical notes (Gemma 4 via Ollama)
+Agent 2: Adherence Miner — Extracts hidden adherence risks from clinical notes (Claude Haiku via Anthropic API)
 Agent 3: Protocol Guardian — Classifies infant risk (HIGH/MODERATE/LOW) + generates actions
 
 Hackathon: Agents Assemble
-AI Backend: Gemma 4 (Local via Ollama)
+AI Backend: Claude Haiku (Anthropic API)
 """
 
 import json
 import os
 from datetime import datetime, timedelta
 
-try:
-    import ollama as _ollama_lib
-    _HAS_OLLAMA_LIB = True
-except ImportError:
-    _HAS_OLLAMA_LIB = False
+import anthropic
 
 from rapidfuzz import fuzz
 
@@ -26,21 +22,11 @@ from schemas import (
 )
 
 # =============================================
-# Gemma 4 via Ollama Setup (for Adherence Miner)
+# Claude Haiku via Anthropic API (for Adherence Miner)
 # =============================================
 
-GEMMA_MODEL = os.environ.get("GEMMA_MODEL", "gemma4:e2b")
-OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-
-HAS_GEMMA = False
-_ollama_client = None
-if _HAS_OLLAMA_LIB:
-    try:
-        _ollama_client = _ollama_lib.Client(host=OLLAMA_HOST)
-        _ollama_client.list()
-        HAS_GEMMA = True
-    except Exception:
-        HAS_GEMMA = False
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5")
+_anthropic_client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
 
 
 # =============================================================================
@@ -217,8 +203,32 @@ def report_adherence_risks(
     return {"reported": len(risks), "risks": risks}
 
 
+_REPORT_TOOL = {
+    "name": "report_adherence_risks",
+    "description": "Report adherence risk indicators found in clinical notes.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "risks": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "indicator": {"type": "string", "description": "Short description of the risk."},
+                        "severity": {"type": "string", "enum": ["low", "moderate", "high"]},
+                        "source_quote": {"type": "string", "description": "Exact quote from the clinical note."},
+                    },
+                    "required": ["indicator", "severity", "source_quote"],
+                },
+            }
+        },
+        "required": ["risks"],
+    },
+}
+
+
 def extract_adherence_risks(clinical_notes: list) -> list:
-    """Extract adherence risk indicators from clinical notes using Gemma 4 native function calling via Ollama."""
+    """Extract adherence risk indicators from clinical notes using Claude Haiku tool use."""
     if not clinical_notes:
         return []
 
@@ -227,20 +237,22 @@ def extract_adherence_risks(clinical_notes: list) -> list:
         notes_text += f"[Date: {note.get('date', 'unknown')}]\n{note['content']}\n\n"
 
     try:
-        response = _ollama_client.chat(
-            model=GEMMA_MODEL,
+        response = _anthropic_client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=1024,
+            system=SYSTEM_PROMPT,
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": f"Analyze these clinical notes:\n\n{notes_text}"},
             ],
-            tools=[report_adherence_risks],
-            options={"temperature": 0.1},
+            tools=[_REPORT_TOOL],
+            tool_choice={"type": "any"},
+            temperature=0.1,
         )
 
         risks_data = []
-        for tc in response.message.tool_calls or []:
-            if tc.function.name == "report_adherence_risks":
-                args = tc.function.arguments
+        for block in response.content:
+            if block.type == "tool_use" and block.name == "report_adherence_risks":
+                args = block.input
                 if isinstance(args, str):
                     args = json.loads(args)
                 risks_data = args.get("risks", [])
@@ -272,7 +284,7 @@ def extract_adherence_risks(clinical_notes: list) -> list:
         return risks
 
     except Exception as e:
-        print(f"[AdherenceMiner] Gemma 4/Ollama error: {e} — falling back to offline extraction")
+        print(f"[AdherenceMiner] Claude Haiku error: {e} — falling back to offline extraction")
         return extract_adherence_risks_offline(clinical_notes)
 
 

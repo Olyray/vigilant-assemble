@@ -4,7 +4,7 @@ VIGILANT MCP Server — Agents Assemble Hackathon Version.
 Exposes 5 MCP tools for the Prompt Opinion platform:
 0. list_patients — List available demo patients
 1. link_infant_to_mother — Probabilistic identity matching
-2. extract_adherence_risks — AI-powered clinical note analysis (Gemma 4 via Ollama)
+2. extract_adherence_risks — AI-powered clinical note analysis (Claude Haiku via Anthropic API)
 3. classify_infant_risk — Rule-based risk classification + FHIR Task
 4. run_full_workflow — Complete pipeline: Link → Extract → Classify
 
@@ -14,7 +14,7 @@ Prompt Opinion delivers FHIR context via HTTP request headers:
   X-Patient-ID        → Current patient ID
 
 Hackathon: Agents Assemble
-AI Backend: Gemma 4 (Local via Ollama)
+AI Backend: Claude Haiku (Anthropic API)
 """
 
 import asyncio
@@ -102,8 +102,7 @@ class _FHIRCapabilityMiddleware(BaseHTTPMiddleware):
 from agents import (
     find_mother,
     extract_adherence_risks as _run_adherence_extraction,
-    extract_adherence_risks_offline as _run_adherence_extraction_offline,
-    HAS_GEMMA, classify_risk, build_bridge_summary,
+    classify_risk, build_bridge_summary,
 )
 from fhir_layer import (
     create_fhir_task, create_fhir_care_plan,
@@ -201,7 +200,7 @@ async def health_check(request: Request) -> JSONResponse:
     return JSONResponse({
         "service": "VIGILANT MCP Server — Agents Assemble",
         "status": "running",
-        "ai_backend": "Gemma 4 (Local via Ollama)" if HAS_GEMMA else "offline (keyword fallback)",
+        "ai_backend": "Claude Haiku (Anthropic API)",
         "tools": [
             "list_patients",
             "link_infant_to_mother",
@@ -294,7 +293,7 @@ def link_infant_to_mother(infant_id: str) -> dict:
 
 @mcp.tool
 def extract_adherence_risks(mother_id: str) -> dict:
-    """Extracts hidden ART adherence risk signals from clinical notes using Gemma4.
+    """Extracts hidden ART adherence risk signals from clinical notes using Claude Haiku.
 
     mother_id: the mother's name (e.g. 'Ruth Banda') or UUID.
     """
@@ -311,7 +310,7 @@ def extract_adherence_risks(mother_id: str) -> dict:
                 "hint": "Use list_patients to see available mothers."}
 
     notes = mother.get("clinical_notes", [])
-    risks = _run_adherence_extraction(notes) if HAS_GEMMA else _run_adherence_extraction_offline(notes)
+    risks = _run_adherence_extraction(notes)
 
     log_data_access(auth.user_id, auth.role, f"mother/{mother_id}/notes",
                     ["clinical_notes"], auth.organization)
@@ -373,7 +372,7 @@ def classify_infant_risk(infant_id: str, mother_id: str) -> dict:
                 "hint": "Use list_patients to see available infants."}
 
     notes = mother.get("clinical_notes", [])
-    risks = _run_adherence_extraction(notes) if HAS_GEMMA else _run_adherence_extraction_offline(notes)
+    risks = _run_adherence_extraction(notes)
 
     risk = classify_risk(mother, risks)
 

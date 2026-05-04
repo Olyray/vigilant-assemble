@@ -2,7 +2,7 @@
 VIGILANT Streamlit UI — Agents Assemble Hackathon Version.
 
 Hackathon: Agents Assemble
-AI Backend: Gemma 4 (Local via Ollama)
+AI Backend: Claude Haiku (Anthropic API)
 Focus: MCP/A2A/SHARP integration demo
 """
 
@@ -13,7 +13,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from agents import find_mother, extract_adherence_risks, extract_adherence_risks_offline, HAS_GEMMA
+from agents import find_mother, extract_adherence_risks
 from agents import classify_risk, build_bridge_summary
 from fhir_layer import create_fhir_task, create_fhir_care_plan
 from security import log_risk_classification, get_last_hash
@@ -48,7 +48,7 @@ else:
     st.sidebar.warning("⚠️ Limited access: Risk Level + Action Only")
 st.sidebar.caption("VIGILANT enforces role-based data access. Sensitive HIV clinical notes are only visible to authorized HIV specialists.")
 st.sidebar.divider()
-st.sidebar.info(f"🤖 AI Backend: **{'Gemma 4 (Local via Ollama)' if HAS_GEMMA else 'Offline (keyword fallback)'}**")
+st.sidebar.info("🤖 AI Backend: **Claude Haiku (Anthropic API)**")
 
 # --- Header ---
 st.title("🛡️ VIGILANT — Agents Assemble")
@@ -113,10 +113,7 @@ elif st.session_state.screen == 2:
         matched_mother = next((m for m in mothers if m["id"] == linkage.mother_id), None)
         with st.spinner("🧠 **MCP Tool 2 — Adherence Intelligence:** Analyzing clinical notes..."):
             notes = matched_mother.get("clinical_notes", [])
-            if HAS_GEMMA:
-                adherence_risks = extract_adherence_risks(notes)
-            else:
-                adherence_risks = extract_adherence_risks_offline(notes)
+            adherence_risks = extract_adherence_risks(notes)
 
         with st.spinner("⚙️ **MCP Tool 3 — Protocol Guardian:** Classifying risk..."):
             risk = classify_risk(matched_mother, adherence_risks)
